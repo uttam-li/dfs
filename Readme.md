@@ -184,23 +184,31 @@ The script provides real-time monitoring and graceful shutdown with `Ctrl+C`.
 ## 📁 Project Structure
 
 ```sh
-├── api/                  # Generated gRPC code
-│   ├── master/           # Master service definitions
-│   ├── chunkserver/      # ChunkServer service definitions
-│   ├── common/           # Shared types
+├── api/                  # gRPC API definitions and generated code
+│   ├── generated/        # Generated gRPC code
+│   │   ├── chunkserver/  # ChunkServer service bindings
+│   │   ├── common/       # Shared type bindings
+│   │   ├── master/       # Master service bindings
+│   │   └── persistence/  # Persistence service bindings
 │   └── proto/            # Protocol buffer definitions
-├── cmd/                  # Main applications
-│   ├── master/           # Master server entry point
-│   ├── chunkserver/      # ChunkServer entry point
-│   └── client/           # FUSE client entry point
-├── configs/              # Configuration management
+├── bin/                  # Compiled binaries
+├── checkpoints/          # Master metadata checkpoints
+├── cmd/                  # Main application entry points
+│   ├── chunkserver/      # ChunkServer executable
+│   ├── client/           # FUSE client executable
+│   └── master/           # Master server executable
+├── logs/                 # Service log files
+├── mnt/                  # FUSE mount point
 ├── pkg/                  # Reusable packages
-│   ├── master/           # Master server implementation
 │   ├── chunkserver/      # ChunkServer implementation
 │   ├── client/           # Client implementation
-│   └── common/           # Shared utilities
+│   ├── common/           # Shared utilities and types
+│   └── master/           # Master server implementation
+├── scripts/              # Automation scripts
+├── storage/              # ChunkServer data storage
 ├── tests/                # System tests and benchmarks
-└── deployments/          # Docker and Kubernetes configs
+├── .env.example          # Environment configuration template
+└── Makefile              # Build and run automation
 ```
 
 ## 📚 References

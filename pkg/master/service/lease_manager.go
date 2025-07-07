@@ -22,7 +22,7 @@ const (
 	DefaultLeaseRenewalRatio = 0.33
 
 	// Default grace period for lease handoff
-	DefaultLeaseHandoffGracePeriod = 2 * time.Second
+ 	DefaultLeaseHandoffGracePeriod = 2 * time.Second
 )
 
 type LeaseState string
