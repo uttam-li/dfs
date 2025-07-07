@@ -1,0 +1,60 @@
+# Build artifacts
+bin/
+build/
+dist/
+
+# Go build cache
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+tests/
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Runtime data directories
+chunks/
+logs/
+mnt/
+perDir/
+data/
+storage/
+checkpoints/
+
+
+# Log files
+*.log
+*.log.*
+
+# Environment and configuration files
+.env
+.env.local
+.env.production
+.env.staging
+config.local.yaml
+config.local.json
+
+# IDE and editor files
+.vscode/
+.idea/
+.github/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Debugging
+debug
+*.trace
+
+# Docker artifacts
+.dockerignore

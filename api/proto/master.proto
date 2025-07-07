@@ -1,0 +1,364 @@
+syntax = "proto3";
+
+package dfs;
+option go_package = "github.com/uttam-li/dfs/api/generated/master";
+
+import "api/proto/common.proto";
+
+service MasterService {
+    // Namespace Operations
+    rpc Lookup(LookupRequest) returns (LookupResponse);
+    rpc GetAttributes(GetAttributesRequest) returns (GetAttributesResponse);
+    rpc SetAttributes(SetAttributesRequest) returns (SetAttributesResponse);
+    rpc Statx(StatxRequest) returns (StatxResponse);
+    rpc CreateEntry(CreateEntryRequest) returns (CreateEntryResponse);
+    rpc DeleteEntry(DeleteEntryRequest) returns (DeleteEntryResponse);
+    rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
+    rpc MoveEntry(MoveEntryRequest) returns (MoveEntryResponse);
+    
+    // Extended Attributes Operations
+    rpc GetXAttr(GetXAttrRequest) returns (GetXAttrResponse);
+    rpc SetXAttr(SetXAttrRequest) returns (SetXAttrResponse);
+    rpc ListXAttr(ListXAttrRequest) returns (ListXAttrResponse);
+    rpc RemoveXAttr(RemoveXAttrRequest) returns (RemoveXAttrResponse);
+    
+    // Chunk Management
+    rpc AllocateChunk(AllocateChunkRequest) returns (AllocateChunkResponse);
+    rpc GetChunkLocations(GetChunkLocationsRequest) returns (GetChunkLocationsResponse);
+    
+    // ChunkServer Management
+    rpc RegisterChunkServer(RegisterChunkServerRequest) returns (RegisterChunkServerResponse);
+    rpc SendHeartbeat(SendHeartbeatRequest) returns (SendHeartbeatResponse);
+    
+    // System Operations
+    rpc GetSystemStats(GetSystemStatsRequest) returns (GetSystemStatsResponse);
+    
+    // Lease Management
+    rpc GrantLease(GrantLeaseRequest) returns (GrantLeaseResponse);
+    rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+    rpc RevokeLease(RevokeLeaseRequest) returns (RevokeLeaseResponse);
+    rpc GetLeaseInfo(GetLeaseInfoRequest) returns (GetLeaseInfoResponse);
+}
+
+message Inode {
+    uint64 ino = 1;
+    FileAttributes attributes = 2;
+    map<string, bytes> xattrs = 3;
+    map<uint64, string> chunk_handles = 4;
+}
+
+// Simple lookup instead of batch
+message LookupRequest {
+    uint64 parent_ino = 1;
+    string name = 2;
+}
+
+message LookupResponse {
+    Inode inode = 1;
+}
+
+message GetAttributesRequest {
+    uint64 inode = 1;
+    uint32 attribute_mask = 2; // Bitmask for requested attributes
+}
+
+message GetAttributesResponse {
+    Inode inode = 1;
+}
+
+message CreateEntryRequest {
+    uint64 parent_ino = 1;
+    string name = 2;
+    EntryType type = 3;
+    FileAttributes attributes = 4;
+    string symlink_target = 5; // Only for symlinks
+    
+    enum EntryType {
+        FILE = 0;
+        DIRECTORY = 1;
+        SYMLINK = 2;
+    }
+}
+
+message CreateEntryResponse {
+    Inode inode = 1;
+}
+
+message AllocateChunkRequest {
+    uint64 file_ino = 1;
+    uint64 chunk_index = 2;
+}
+
+message AllocateChunkResponse {
+    string chunk_handle = 1;
+    repeated ChunkLocation locations = 2;
+    int64 lease_expiry = 3;
+}
+
+message GetChunkLocationsRequest {
+    repeated string chunk_handles = 1; // Batch support
+}
+
+message GetChunkLocationsResponse {
+    repeated ChunkLocationInfo chunks = 1;
+    
+    message ChunkLocationInfo {
+        string chunk_handle = 1;
+        repeated ChunkLocation locations = 2;
+        uint32 version = 3;
+        uint64 size = 4;
+    }
+}
+
+message SendHeartbeatRequest {
+    string server_id = 1;
+    ServerStats stats = 2;
+    repeated ChunkReport chunk_reports = 3;
+    
+    message ServerStats {
+        uint64 total_space = 1;
+        uint64 used_space = 2;
+        uint64 available_space = 3;
+        uint32 pending_deletes = 4;
+        uint32 active_connections = 5;
+        double cpu_usage = 6;
+        double memory_usage = 7;
+    }
+    
+    message ChunkReport {
+        string chunk_handle = 1;
+        uint32 version = 2;
+        uint64 size = 3;
+        bytes checksum = 4;
+    }
+}
+
+message SendHeartbeatResponse {
+    repeated string chunks_to_delete = 1;
+    repeated ChunkReplicationOrder replication_orders = 2;
+    int64 next_heartbeat_interval = 3;
+    
+    message ChunkReplicationOrder {
+        string chunk_handle = 1;
+        repeated string target_servers = 2;
+        uint32 priority = 3; // 0=highest
+    }
+}
+
+message SetAttributesRequest {
+    uint64 ino = 1;
+    FileAttributes attributes = 2;
+    uint32 attribute_mask = 3; // Bitmask for which attributes to update
+}
+
+message SetAttributesResponse {
+    FileAttributes new_attributes = 1;
+}
+
+message DeleteEntryRequest {
+    uint64 parent_ino = 1;
+    string name = 2;
+    bool recursive = 3; // For directory deletion
+}
+
+message DeleteEntryResponse {
+    uint64 deleted_ino = 1;
+    repeated string freed_chunks = 2; // Chunks that need cleanup
+}
+
+message ListDirectoryRequest {
+    uint64 dir_ino = 1;
+    string continuation_token = 2; // For pagination
+    uint32 max_entries = 3;
+}
+
+message ListDirectoryResponse {
+    repeated DirectoryEntry entries = 1;
+    string next_continuation_token = 2;
+    bool has_more = 3;
+    
+    message DirectoryEntry {
+        string name = 1;
+        uint64 ino = 2;
+        uint32 type = 3; // 0=file, 1=dir, 2=symlink
+        FileAttributes attributes = 4;
+    }
+}
+
+message MoveEntryRequest {
+    uint64 old_parent_ino = 1;
+    string old_name = 2;
+    uint64 new_parent_ino = 3;
+    string new_name = 4;
+}
+
+message MoveEntryResponse {
+    Inode updated_inode = 1;
+}
+
+message RegisterChunkServerRequest {
+    string server_id = 1;
+    string address = 2;
+    uint64 total_space = 3;
+    repeated string existing_chunks = 4; // For restart recovery
+}
+
+message RegisterChunkServerResponse {
+    int64 heartbeat_interval = 1;
+    repeated string chunks_to_delete = 2; // Cleanup from previous session
+    string assigned_server_id = 3; // In case server_id was modified
+}
+
+message GetSystemStatsRequest {
+}
+
+message GetSystemStatsResponse {
+    SystemStats stats = 1;
+    
+    message SystemStats {
+        uint32 total_chunk_servers = 1;
+        uint32 active_chunk_servers = 2;
+        uint64 total_inodes = 3;
+        uint64 used_inodes = 4;
+        uint64 free_inodes = 5;
+        uint64 total_chunks = 6;
+        uint64 total_files = 7;
+        uint64 total_directories = 8;
+        uint64 total_space = 9;
+        uint64 used_space = 10;
+        uint64 available_space = 11;
+        double replication_factor = 12;
+        uint32 under_replicated_chunks = 13;
+        uint32 over_replicated_chunks = 14;
+    }
+}
+
+message StatxRequest {
+    uint64 ino = 1;
+    uint32 mask = 2;        // STATX_* flags indicating which fields are requested
+    uint32 flags = 3;       // AT_* flags
+}
+
+message StatxResponse {
+    StatxAttributes attributes = 1;
+    uint32 mask = 2;        // STATX_* flags indicating which fields are valid
+}
+
+message StatxAttributes {
+    uint32 mode = 1;        // File type and mode
+    uint32 uid = 2;         // User ID of owner
+    uint32 gid = 3;         // Group ID of owner
+    uint64 size = 4;        // Total size in bytes
+    uint64 blocks = 5;      // Number of 512B blocks allocated
+    uint32 blksize = 6;     // Block size for filesystem I/O
+    uint32 nlink = 7;       // Number of hard links
+    uint64 ino = 8;         // Inode number
+    uint32 rdev_major = 9;  // Device major ID (if special file)
+    uint32 rdev_minor = 10; // Device minor ID (if special file)
+    uint32 dev_major = 11;  // Device major ID containing file
+    uint32 dev_minor = 12;  // Device minor ID containing file
+    
+    // Timestamps with nanosecond precision
+    StatxTimestamp atime = 13;  // Last access time
+    StatxTimestamp mtime = 14;  // Last modification time
+    StatxTimestamp ctime = 15;  // Last status change time
+    StatxTimestamp btime = 16;  // Creation time (birth time)
+}
+
+message StatxTimestamp {
+    int64 sec = 1;   // Seconds since epoch
+    uint32 nsec = 2; // Nanoseconds
+}
+
+// Extended Attributes Messages
+message GetXAttrRequest {
+    uint64 ino = 1;
+    string name = 2;
+}
+
+message GetXAttrResponse {
+    bytes value = 1;
+}
+
+message SetXAttrRequest {
+    uint64 ino = 1;
+    string name = 2;
+    bytes value = 3;
+    uint32 flags = 4; // XATTR_CREATE, XATTR_REPLACE, etc.
+}
+
+message SetXAttrResponse {
+    // Empty response - success indicated by lack of error
+}
+
+message ListXAttrRequest {
+    uint64 ino = 1;
+}
+
+message ListXAttrResponse {
+    repeated string names = 1;
+}
+
+message RemoveXAttrRequest {
+    uint64 ino = 1;
+    string name = 2;
+}
+
+message RemoveXAttrResponse {
+    // Empty response - success indicated by lack of error
+}
+
+// Lease Management Messages
+message GrantLeaseRequest {
+    string chunk_handle = 1;
+    string requesting_server = 2;
+    repeated string replicas = 3;
+    uint64 version = 4;
+}
+
+message GrantLeaseResponse {
+    string lease_id = 1;
+    string primary = 2;
+    int64 expire_time = 3; // Unix timestamp
+    int64 renewable_after = 4; // Unix timestamp
+}
+
+message RenewLeaseRequest {
+    string chunk_handle = 1;
+    string lease_id = 2;
+    string primary = 3;
+    uint64 version = 4;
+}
+
+message RenewLeaseResponse {
+    string lease_id = 1;
+    int64 expire_time = 2; // Unix timestamp
+    int64 renewable_after = 3; // Unix timestamp
+    int32 renewal_count = 4;
+}
+
+message RevokeLeaseRequest {
+    string chunk_handle = 1;
+    string reason = 2;
+}
+
+message RevokeLeaseResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetLeaseInfoRequest {
+    string chunk_handle = 1;
+}
+
+message GetLeaseInfoResponse {
+    string lease_id = 1;
+    string primary = 2;
+    repeated string replicas = 3;
+    uint64 version = 4;
+    int64 granted_at = 5; // Unix timestamp
+    int64 expire_time = 6; // Unix timestamp
+    int64 renewable_after = 7; // Unix timestamp
+    string state = 8;
+    int32 renewal_count = 9;
+}

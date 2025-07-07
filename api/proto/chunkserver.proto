@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package dfs;
+option go_package = "github.com/uttam-li/dfs/api/generated/chunkserver";
+
+service ChunkServerService {
+    // Data Operations
+    rpc ReadChunk(ReadChunkRequest) returns (ReadChunkResponse);
+    rpc CreateChunk(CreateChunkRequest) returns (CreateChunkResponse);
+    rpc DeleteChunks(DeleteChunksRequest) returns (DeleteChunksResponse);
+    rpc GetChunkInfo(GetChunkInfoRequest) returns (GetChunkInfoResponse);
+    
+    // Two-Phase Write Protocol
+    rpc BufferData(BufferDataRequest) returns (BufferDataResponse);
+    rpc SerializeWrites(SerializeWritesRequest) returns (SerializeWritesResponse);
+    rpc ApplyWrites(ApplyWritesRequest) returns (ApplyWritesResponse);
+    
+    // Replication Operations
+    rpc ReplicateChunk(ReplicateChunkRequest) returns (ReplicateChunkResponse);
+    
+    // Health and Maintenance Operations
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message ReadChunkRequest {
+    string chunk_handle = 1;
+    uint64 offset = 2;
+    uint32 length = 3;
+    uint32 version = 4;
+    bytes expected_checksum = 5; // For verification
+}
+
+message ReadChunkResponse {
+    bytes data = 1;
+    bytes checksum = 2;
+    bool is_final_chunk = 3;
+}
+
+message CreateChunkRequest {
+    string chunk_handle = 1;
+    uint32 version = 2;
+    uint64 initial_size = 3;
+}
+
+message CreateChunkResponse {
+    uint64 allocated_size = 1;
+}
+
+message DeleteChunksRequest {
+    repeated string chunk_handles = 1;
+}
+
+message DeleteChunksResponse {
+    repeated DeleteResult results = 1;
+    
+    message DeleteResult {
+        string chunk_handle = 1;
+        uint64 freed_space = 2;
+    }
+}
+
+message GetChunkInfoRequest {
+    string chunk_handle = 1;
+}
+
+message GetChunkInfoResponse {
+    bool exists = 1;
+    uint64 size = 2;
+    uint32 version = 3;
+    bytes checksum = 4;
+    int64 created_time = 5;
+    int64 last_modified = 6;
+}
+
+message ReplicateChunkRequest {
+    string chunk_handle = 1;
+    string source_server = 2;
+    uint32 target_version = 3;
+}
+
+message ReplicateChunkResponse {
+    uint64 chunk_size = 1;
+    bytes checksum = 2;
+}
+
+message ServerHealth {
+    double cpu_usage = 1;
+    double memory_usage = 2;
+    double disk_usage = 3;
+    uint32 active_connections = 4;
+    int64 uptime_seconds = 5;
+}
+
+// Chunk health check operation
+message HealthCheckRequest {
+}
+
+message HealthCheckResponse {
+    bool is_healthy = 1;
+    repeated string issues = 2; // List of any health issues
+    ServerHealth health = 3;
+}
+
+// Two-Phase Write Protocol Messages
+message BufferDataRequest {
+    string write_id = 1;
+    string chunk_handle = 2;
+    uint64 offset = 3;
+    bytes data = 4;
+    uint32 version = 5;
+}
+
+message BufferDataResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+
+message SerializeWritesRequest {
+    string chunk_handle = 1;
+    repeated string write_ids = 2;
+    repeated string replica_servers = 3;
+}
+
+message SerializeWritesResponse {
+    bool success = 1;
+    string error_message = 2;
+    uint32 writes_applied = 3;
+}
+
+message ApplyWritesRequest {
+    string chunk_handle = 1;
+    repeated WriteOperation write_operations = 2;
+    
+    message WriteOperation {
+        uint64 offset = 1;
+        bytes data = 2;
+    }
+}
+
+message ApplyWritesResponse {
+    bool success = 1;
+    string error_message = 2;
+    uint64 new_chunk_size = 3;
+    bytes checksum = 4;
+}
