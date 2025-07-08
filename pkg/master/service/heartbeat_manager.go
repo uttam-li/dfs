@@ -247,7 +247,6 @@ func (hm *HeartbeatManager) handleServerFailure(serverID uuid.UUID) {
 	// Notify replication manager about server failure
 	if hm.masterService.replicationManager != nil {
 		hm.masterService.replicationManager.HandleServerFailure(serverAddress)
-		go hm.masterService.replicationManager.CheckReplicationNeeds()
 	}
 
 	// Revoke leases held by the failed server

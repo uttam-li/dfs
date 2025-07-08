@@ -161,22 +161,17 @@ func (cs *ChunkServerService) WriteChunk(handle string, offset uint64, data []by
 		return fmt.Errorf("failed to write chunk data: %w", err)
 	}
 
-	if err := file.Sync(); err != nil {
-		select {
-		case <-cs.ctx.Done():
-			log.Printf("Sync failed during shutdown for chunk %s: %v", handle, err)
-		default:
-			return fmt.Errorf("failed to sync chunk file: %w", err)
-		}
-	}
-
+	// Only sync periodically or for final writes to reduce disk I/O bottleneck
+	// During replication, we'll sync at the end in ReplicateChunkFromSource
+	// For now, just ensure data is written but don't force expensive sync on every write
+	
+	// Update metadata quickly (short lock hold time)
 	cs.storage.mu.Lock()
 	newSize := offset + uint64(bytesWritten)
 	if newSize > metadata.Size {
 		metadata.Size = newSize
 	}
 	metadata.LastModified = time.Now()
-	metadata.Checksum = cs.computeChecksum(metadata.FilePath)
 	cs.storage.mu.Unlock()
 
 	return nil
@@ -332,6 +327,12 @@ func (cs *ChunkServerService) ReplicateChunkFromSource(ctx context.Context, hand
 		return fmt.Errorf("failed to stream copy chunk: %w", err)
 	}
 
+	// Finalize the chunk: sync to disk and compute checksum
+	if err := cs.finalizeChunk(handle); err != nil {
+		log.Printf("Failed to finalize chunk %s after replication: %v", handle, err)
+		// Don't fail the replication for finalization errors, but log them
+	}
+
 	return nil
 }
 
@@ -416,6 +417,40 @@ func (cs *ChunkServerService) streamCopyChunk(ctx context.Context, client chunks
 		default:
 		}
 	}
+
+	return nil
+}
+
+// finalizeChunk syncs the chunk to disk and computes its checksum.
+// This should be called after all writes to a chunk are complete.
+func (cs *ChunkServerService) finalizeChunk(handle string) error {
+	cs.storage.mu.RLock()
+	metadata, exists := cs.storage.chunks[handle]
+	if !exists {
+		cs.storage.mu.RUnlock()
+		return fmt.Errorf("chunk not found: %s", handle)
+	}
+	filePath := metadata.FilePath
+	cs.storage.mu.RUnlock()
+
+	// Sync the file to disk
+	file, err := os.OpenFile(filePath, os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open chunk file for sync: %w", err)
+	}
+	
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return fmt.Errorf("failed to sync chunk file: %w", err)
+	}
+	file.Close()
+
+	// Compute and update checksum
+	cs.storage.mu.Lock()
+	if metadata, exists := cs.storage.chunks[handle]; exists {
+		metadata.Checksum = cs.computeChecksum(filePath)
+	}
+	cs.storage.mu.Unlock()
 
 	return nil
 }

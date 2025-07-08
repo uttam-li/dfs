@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -26,22 +27,17 @@ type ReplicationManager struct {
 	mu            sync.RWMutex
 	masterService *MasterService
 
-	replicationQueue   chan *ReplicationTask
-	priorityQueue      chan *ReplicationTask // High-priority queue for critical chunks
-	activeReplications map[common.ChunkHandle]*ReplicationStatus
-	batchReplications  map[string]*BatchReplicationJob // server -> batch job
+	replicationQueue       chan *ReplicationTask
+	activeReplications     map[common.ChunkHandle]*ReplicationStatus
+	queuedChunks           map[common.ChunkHandle]bool // Track queued chunks to avoid duplicates
+	serverReplicationCount map[string]int              // Track active replications per server
 
 	// Configuration for replication
-	replicationFactor    int
-	maxWorkers           int
-	maxBatchSize         int           // Maximum chunks per batch
-	maxConcurrentBatches int           // Maximum concurrent batches per server
-	batchTimeout         time.Duration // Timeout for batch operations
-	monitorInterval      time.Duration
-
-	// Chunk streaming configuration
-	streamChunkSize uint32        // Size of streaming chunks (e.g., 1MB)
-	streamTimeout   time.Duration // Timeout for streaming operations
+	replicationFactor        int
+	maxWorkers               int
+	maxReplicationsPerServer int           // Max concurrent replications per target server
+	monitorInterval          time.Duration // How often to scan for under-replicated chunks
+	workerCheckInterval      time.Duration // How often workers check for tasks
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -49,10 +45,12 @@ type ReplicationManager struct {
 	state  common.ServiceState
 }
 
-// ReplicationTask represents a chunk replication request with priority.
+// ReplicationTask represents a chunk replication request.
 type ReplicationTask struct {
-	ChunkHandle common.ChunkHandle
-	Priority    ReplicationPriority
+	ChunkHandle  common.ChunkHandle
+	SourceServer string
+	TargetServer string
+	RetryCount   int // Track retry attempts for backoff
 }
 
 // DeletionTask represents a chunk deletion request (kept for compatibility).
@@ -67,22 +65,19 @@ func NewReplicationManager(masterService *MasterService) *ReplicationManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &ReplicationManager{
-		masterService:        masterService,
-		replicationQueue:     make(chan *ReplicationTask, 1000),
-		priorityQueue:        make(chan *ReplicationTask, 500),
-		activeReplications:   make(map[common.ChunkHandle]*ReplicationStatus),
-		batchReplications:    make(map[string]*BatchReplicationJob),
-		replicationFactor:    masterService.config.ReplicationFactor,
-		maxWorkers:           6,
-		maxBatchSize:         10,
-		maxConcurrentBatches: 3,
-		batchTimeout:         5 * time.Minute,
-		monitorInterval:      90 * time.Second,
-		streamChunkSize:      1024 * 1024,
-		streamTimeout:        30 * time.Second,
-		ctx:                  ctx,
-		cancel:               cancel,
-		state:                common.ServiceStateUnknown,
+		masterService:            masterService,
+		replicationQueue:         make(chan *ReplicationTask, 2000), // Larger queue for simplicity
+		activeReplications:       make(map[common.ChunkHandle]*ReplicationStatus),
+		queuedChunks:             make(map[common.ChunkHandle]bool),
+		serverReplicationCount:   make(map[string]int),
+		replicationFactor:        masterService.config.ReplicationFactor,
+		maxWorkers:               3,                
+		maxReplicationsPerServer: 5,                
+		monitorInterval:          10 * time.Second, 
+		workerCheckInterval:      5 * time.Second,
+		ctx:                      ctx,
+		cancel:                   cancel,
+		state:                    common.ServiceStateUnknown,
 	}
 }
 
@@ -103,12 +98,9 @@ func (rm *ReplicationManager) Start(ctx context.Context) error {
 	}
 
 	rm.wg.Add(1)
-	go rm.batchReplicationCoordinator()
-
-	rm.wg.Add(1)
 	go rm.replicationMonitor()
 
-	log.Printf("Replication manager started with %d workers, batch coordinator, and monitor (interval: %v)",
+	log.Printf("Replication manager started with %d workers and monitor (interval: %v)",
 		rm.maxWorkers, rm.monitorInterval)
 	return nil
 }
@@ -144,35 +136,82 @@ func (rm *ReplicationManager) UpdateServerLoad(addr string, totalSpace, usedSpac
 	// Simplified - no complex load tracking needed for basic replication
 }
 
-// QueueReplication queues a chunk for replication with the specified priority.
+// QueueReplication queues a chunk for replication by finding suitable servers.
 func (rm *ReplicationManager) QueueReplication(chunkHandle common.ChunkHandle, priority ReplicationPriority) {
 	if !rm.IsRunning() {
 		return
 	}
 
+	// Check if already being processed or queued
 	rm.mu.Lock()
 	if _, exists := rm.activeReplications[chunkHandle]; exists {
 		rm.mu.Unlock()
 		return
 	}
+	if rm.queuedChunks[chunkHandle] {
+		rm.mu.Unlock()
+		return // Already queued
+	}
 	rm.mu.Unlock()
 
-	task := &ReplicationTask{
-		ChunkHandle: chunkHandle,
-		Priority:    priority,
+	// Get chunk metadata and find servers
+	rm.masterService.metadataLock.RLock()
+	chunkMeta, exists := rm.masterService.master.ChunkMetadata[chunkHandle]
+	if !exists {
+		rm.masterService.metadataLock.RUnlock()
+		return
 	}
 
-	var targetQueue chan *ReplicationTask
-	if priority == PriorityCritical || priority == PriorityHigh {
-		targetQueue = rm.priorityQueue
-	} else {
-		targetQueue = rm.replicationQueue
+	activeServers := rm.getActiveServers()
+	activeReplicas := rm.countActiveReplicas(chunkMeta.Locations, activeServers)
+
+	// Skip if enough replicas
+	if activeReplicas >= rm.replicationFactor {
+		rm.masterService.metadataLock.RUnlock()
+		return
 	}
+
+	// Find source and target servers
+	sourceServer := rm.selectOptimalSourceServer(chunkMeta.Locations, activeServers)
+	targetServer := rm.selectOptimalTargetServer(chunkMeta.Locations, activeServers)
+	rm.masterService.metadataLock.RUnlock()
+
+	if sourceServer == "" || targetServer == "" {
+		// No suitable servers right now, will be retried next monitoring cycle
+		return
+	}
+
+	// Check if target server is at capacity before queueing
+	rm.mu.RLock()
+	currentLoad := rm.serverReplicationCount[targetServer]
+	rm.mu.RUnlock()
+
+	if currentLoad >= rm.maxReplicationsPerServer {
+		// Target server is busy, will retry next monitoring cycle (don't log to reduce spam)
+		return
+	}
+
+	// Create replication task with specific servers
+	task := &ReplicationTask{
+		ChunkHandle:  chunkHandle,
+		SourceServer: sourceServer,
+		TargetServer: targetServer,
+		RetryCount:   0,
+	}
+
+	// Mark as queued and queue the task
+	rm.mu.Lock()
+	rm.queuedChunks[chunkHandle] = true
+	rm.mu.Unlock()
 
 	select {
-	case targetQueue <- task:
+	case rm.replicationQueue <- task:
 		// Successfully queued
 	default:
+		// Queue full, remove from queued set
+		rm.mu.Lock()
+		delete(rm.queuedChunks, chunkHandle)
+		rm.mu.Unlock()
 		log.Printf("REPLICATION: Queue full, dropping task for chunk %v", chunkHandle)
 	}
 }
@@ -200,11 +239,25 @@ func (rm *ReplicationManager) CheckReplicationNeeds() {
 		return
 	}
 
+	// Add a brief delay to avoid overwhelming the system during concurrent checks
+	select {
+	case <-time.After(100 * time.Millisecond):
+	case <-rm.ctx.Done():
+		return
+	}
+
 	rm.masterService.metadataLock.RLock()
 	defer rm.masterService.metadataLock.RUnlock()
 
 	underReplicated := 0
+	queued := 0
 	activeServers := rm.getActiveServers()
+
+	// If we have very few active servers, be more conservative with replication
+	maxChunksToQueue := 50
+	if len(activeServers) <= 2 {
+		maxChunksToQueue = 20 // Reduce load when few servers available
+	}
 
 	for chunkHandle, chunkMeta := range rm.masterService.master.ChunkMetadata {
 		activeReplicas := rm.countActiveReplicas(chunkMeta.Locations, activeServers)
@@ -212,12 +265,22 @@ func (rm *ReplicationManager) CheckReplicationNeeds() {
 		if activeReplicas < rm.replicationFactor {
 			underReplicated++
 			priority := rm.calculatePriority(activeReplicas)
-			rm.QueueReplication(chunkHandle, priority)
+
+			// Rate limit: queue chunks based on available server capacity
+			if queued < maxChunksToQueue {
+				rm.QueueReplication(chunkHandle, priority)
+				queued++
+			}
 		}
 	}
 
 	if underReplicated > 0 {
-		log.Printf("REPLICATION: Found %d under-replicated chunks", underReplicated)
+		activeServersList := make([]string, 0, len(activeServers))
+		for server := range activeServers {
+			activeServersList = append(activeServersList, server)
+		}
+		log.Printf("REPLICATION: Found %d under-replicated chunks (queued %d), active servers: %v",
+			underReplicated, queued, activeServersList)
 	}
 }
 
@@ -288,34 +351,6 @@ type ReplicationStatus struct {
 	TotalBytes       uint64
 }
 
-// BatchReplicationJob manages multiple chunk replications to the same target server.
-type BatchReplicationJob struct {
-	TargetServer    string
-	Chunks          []*ReplicationTask
-	StartTime       time.Time
-	CompletedChunks int
-	FailedChunks    int
-	mu              sync.RWMutex
-}
-
-// AddChunk safely adds a chunk task to the batch job.
-func (b *BatchReplicationJob) AddChunk(task *ReplicationTask) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.Chunks = append(b.Chunks, task)
-}
-
-// MarkCompleted safely marks a chunk as completed or failed.
-func (b *BatchReplicationJob) MarkCompleted(success bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if success {
-		b.CompletedChunks++
-	} else {
-		b.FailedChunks++
-	}
-}
-
 // StreamingChunk represents a chunk of data for streaming replication operations.
 type StreamingChunk struct {
 	ChunkHandle common.ChunkHandle
@@ -325,7 +360,7 @@ type StreamingChunk struct {
 	IsLast      bool
 }
 
-// replicationWorker processes replication tasks
+// replicationWorker processes replication tasks from the queue
 func (rm *ReplicationManager) replicationWorker(workerID int) {
 	defer rm.wg.Done()
 
@@ -336,15 +371,9 @@ func (rm *ReplicationManager) replicationWorker(workerID int) {
 		case <-rm.ctx.Done():
 			log.Printf("REPLICATION: Worker %d stopping", workerID)
 			return
-		case task := <-rm.priorityQueue:
-			if task == nil {
-				return
-			}
-			log.Printf("REPLICATION: Worker %d processing priority task %v", workerID, task.ChunkHandle)
-			rm.processReplication(task)
 		case task := <-rm.replicationQueue:
 			if task == nil {
-				return
+				return // Channel closed
 			}
 			log.Printf("REPLICATION: Worker %d processing task %v", workerID, task.ChunkHandle)
 			rm.processReplication(task)
@@ -354,10 +383,67 @@ func (rm *ReplicationManager) replicationWorker(workerID int) {
 
 func (rm *ReplicationManager) processReplication(task *ReplicationTask) {
 	rm.mu.Lock()
+	// Remove from queued set since we're now processing
+	delete(rm.queuedChunks, task.ChunkHandle)
+
+	// Atomically check capacity and reserve slot if available
+	currentCount := rm.serverReplicationCount[task.TargetServer]
+	if currentCount >= rm.maxReplicationsPerServer {
+		rm.mu.Unlock()
+		// Reduce log spam by only logging every 10th re-queue for the same reason
+		if task.RetryCount%10 == 0 {
+			log.Printf("REPLICATION: Target server %s at capacity (%d/%d), re-queueing chunk %v (retry #%d)",
+				task.TargetServer, currentCount, rm.maxReplicationsPerServer, task.ChunkHandle, task.RetryCount)
+		}
+		// Re-queue with exponential backoff to avoid overwhelming the system
+		go func(retryCount int) {
+			// Exponential backoff: 30s, 60s, 120s, max 300s (5 minutes)
+			backoffDelay := time.Duration(30*(1<<retryCount)) * time.Second
+			if backoffDelay > 5*time.Minute {
+				backoffDelay = 5 * time.Minute
+			}
+			time.Sleep(backoffDelay)
+
+			// After several retries, try re-selecting servers to avoid persistent bottlenecks
+			if retryCount >= 3 {
+				rm.QueueReplication(task.ChunkHandle, PriorityNormal)
+				return
+			}
+
+			// Create new task with incremented retry count
+			newTask := &ReplicationTask{
+				ChunkHandle:  task.ChunkHandle,
+				SourceServer: task.SourceServer,
+				TargetServer: task.TargetServer,
+				RetryCount:   retryCount + 1,
+			}
+
+			// Re-queue directly to avoid re-computing servers
+			rm.mu.Lock()
+			rm.queuedChunks[task.ChunkHandle] = true
+			rm.mu.Unlock()
+
+			select {
+			case rm.replicationQueue <- newTask:
+				// Successfully re-queued
+			default:
+				// Queue full, remove from queued set
+				rm.mu.Lock()
+				delete(rm.queuedChunks, task.ChunkHandle)
+				rm.mu.Unlock()
+			}
+		}(task.RetryCount)
+		return
+	}
+
+	// Atomically reserve a slot by incrementing the count
+	rm.serverReplicationCount[task.TargetServer] = currentCount + 1
+
 	rm.activeReplications[task.ChunkHandle] = &ReplicationStatus{
 		ChunkHandle:      task.ChunkHandle,
+		SourceServer:     task.SourceServer,
+		TargetServer:     task.TargetServer,
 		StartTime:        time.Now(),
-		Priority:         task.Priority,
 		StreamsActive:    0,
 		BytesTransferred: 0,
 		TotalBytes:       0,
@@ -367,16 +453,25 @@ func (rm *ReplicationManager) processReplication(task *ReplicationTask) {
 	defer func() {
 		rm.mu.Lock()
 		delete(rm.activeReplications, task.ChunkHandle)
+		// Decrement server replication count
+		rm.serverReplicationCount[task.TargetServer]--
+		if rm.serverReplicationCount[task.TargetServer] == 0 {
+			delete(rm.serverReplicationCount, task.TargetServer)
+		}
 		rm.mu.Unlock()
 	}()
 
-	log.Printf("REPLICATION: Processing chunk %v (priority: %d)", task.ChunkHandle, task.Priority)
+	log.Printf("REPLICATION: Processing chunk %v from %s to %s", task.ChunkHandle, task.SourceServer, task.TargetServer)
 
-	// Get current chunk metadata
+	// Add a small delay to reduce pressure on target server
+	time.Sleep(100 * time.Millisecond)
+
+	// Get current chunk metadata to verify it still needs replication
 	rm.masterService.metadataLock.RLock()
 	chunkMeta, exists := rm.masterService.master.ChunkMetadata[task.ChunkHandle]
 	if !exists {
 		rm.masterService.metadataLock.RUnlock()
+		log.Printf("REPLICATION: Chunk %v not found in metadata, skipping", task.ChunkHandle)
 		return
 	}
 
@@ -390,39 +485,62 @@ func (rm *ReplicationManager) processReplication(task *ReplicationTask) {
 		return
 	}
 
-	sourceServer := rm.selectOptimalSourceServer(chunkMeta.Locations, activeServers)
-	targetServer := rm.selectOptimalTargetServer(chunkMeta.Locations, activeServers)
+	// Verify servers are still active
+	if !activeServers[task.SourceServer] || !activeServers[task.TargetServer] {
+		log.Printf("REPLICATION: Source (%s) or target (%s) server not active, re-queueing chunk %v",
+			task.SourceServer, task.TargetServer, task.ChunkHandle)
 
-	if sourceServer == "" || targetServer == "" {
-		log.Printf("REPLICATION: Cannot find suitable servers for chunk %v", task.ChunkHandle)
+		// Re-queue with delay to avoid tight retry loops
+		go func(retryCount int) {
+			// Backoff for server unavailability: 5s, 10s, 20s, max 60s
+			backoffDelay := time.Duration(5*(1<<retryCount)) * time.Second
+			if backoffDelay > time.Minute {
+				backoffDelay = time.Minute
+			}
+			time.Sleep(backoffDelay)
+			rm.QueueReplication(task.ChunkHandle, PriorityNormal)
+		}(task.RetryCount)
 		return
 	}
 
-	rm.mu.Lock()
-	if status, exists := rm.activeReplications[task.ChunkHandle]; exists {
-		status.SourceServer = sourceServer
-		status.TargetServer = targetServer
-	}
-	rm.mu.Unlock()
+	// Attempt replication
+	success := rm.replicateChunkStreaming(task.ChunkHandle, task.SourceServer, task.TargetServer, chunkMeta.Version)
 
-	if rm.replicateChunkStreaming(task.ChunkHandle, sourceServer, targetServer, chunkMeta.Version) {
-		rm.updateChunkLocation(task.ChunkHandle, targetServer)
+	if success {
+		rm.updateChunkLocation(task.ChunkHandle, task.TargetServer)
 		log.Printf("REPLICATION: Successfully replicated chunk %v from %s to %s",
-			task.ChunkHandle, sourceServer, targetServer)
+			task.ChunkHandle, task.SourceServer, task.TargetServer)
 	} else {
-		log.Printf("REPLICATION: Failed to replicate chunk %v from %s to %s",
-			task.ChunkHandle, sourceServer, targetServer)
+		log.Printf("REPLICATION: Failed to replicate chunk %v from %s to %s, re-queueing",
+			task.ChunkHandle, task.SourceServer, task.TargetServer)
+
+		// Re-queue with exponential backoff for failures
+		go func(retryCount int) {
+			// Exponential backoff: 30s, 60s, 120s, max 300s (5 minutes)
+			backoffDelay := time.Duration(30*(1<<retryCount)) * time.Second
+			if backoffDelay > 5*time.Minute {
+				backoffDelay = 5 * time.Minute
+			}
+			time.Sleep(backoffDelay)
+			rm.QueueReplication(task.ChunkHandle, PriorityNormal)
+		}(task.RetryCount)
 	}
 }
 
 func (rm *ReplicationManager) selectOptimalSourceServer(locations []string, activeServers map[string]bool) string {
-	// For now, use the first available server (can be enhanced with load balancing)
+	// Collect available source servers
+	var candidates []string
 	for _, location := range locations {
 		if activeServers[location] {
-			return location
+			candidates = append(candidates, location)
 		}
 	}
-	return ""
+
+	// Return random candidate to distribute load
+	if len(candidates) == 0 {
+		return ""
+	}
+	return candidates[rand.Intn(len(candidates))]
 }
 
 func (rm *ReplicationManager) selectOptimalTargetServer(locations []string, activeServers map[string]bool) string {
@@ -431,13 +549,44 @@ func (rm *ReplicationManager) selectOptimalTargetServer(locations []string, acti
 		existing[location] = true
 	}
 
-	// For now, use the first available server (can be enhanced with load balancing)
+	// Collect available target servers and their current load
+	type serverLoad struct {
+		addr string
+		load int
+	}
+	var candidates []serverLoad
+
+	rm.mu.RLock()
 	for serverAddr := range activeServers {
 		if !existing[serverAddr] {
-			return serverAddr
+			load := rm.serverReplicationCount[serverAddr]
+			candidates = append(candidates, serverLoad{addr: serverAddr, load: load})
 		}
 	}
-	return ""
+	rm.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	// Find servers with minimum load
+	minLoad := candidates[0].load
+	for _, candidate := range candidates {
+		if candidate.load < minLoad {
+			minLoad = candidate.load
+		}
+	}
+
+	// Filter to servers with minimum load
+	var minLoadCandidates []string
+	for _, candidate := range candidates {
+		if candidate.load == minLoad {
+			minLoadCandidates = append(minLoadCandidates, candidate.addr)
+		}
+	}
+
+	// Return random candidate among those with minimum load
+	return minLoadCandidates[rand.Intn(len(minLoadCandidates))]
 }
 
 func (rm *ReplicationManager) replicateChunkStreaming(chunkHandle common.ChunkHandle, sourceServer, targetServer string, version uint16) bool {
@@ -454,7 +603,8 @@ func (rm *ReplicationManager) replicateChunkStreaming(chunkHandle common.ChunkHa
 
 	targetClient := chunkserver.NewChunkServerServiceClient(targetConn)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Use a shorter timeout and add retries for robustness
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	req := &chunkserver.ReplicateChunkRequest{
@@ -466,6 +616,9 @@ func (rm *ReplicationManager) replicateChunkStreaming(chunkHandle common.ChunkHa
 	start := time.Now()
 	_, err = targetClient.ReplicateChunk(ctx, req)
 	duration := time.Since(start)
+
+	// Release connection after use to help with connection management
+	defer rm.masterService.chunkServerClientManager.ReleaseConnection(targetServer)
 
 	if err == nil {
 		log.Printf("REPLICATION: Chunk %v replicated in %v", chunkHandle, duration)
@@ -522,52 +675,6 @@ func (rm *ReplicationManager) replicationMonitor() {
 				rm.cleanupStaleReplications()
 			}
 		}
-	}
-}
-
-func (rm *ReplicationManager) batchReplicationCoordinator() {
-	defer rm.wg.Done()
-
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	log.Printf("REPLICATION: Batch coordinator started (checking every 2 seconds)")
-
-	for {
-		select {
-		case <-rm.ctx.Done():
-			log.Printf("REPLICATION: Batch coordinator stopping")
-			return
-		case <-ticker.C:
-			rm.processBatchOpportunities()
-			rm.processQueueStatus()
-		}
-	}
-}
-
-func (rm *ReplicationManager) processBatchOpportunities() {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	for serverAddr, batchJob := range rm.batchReplications {
-		if time.Since(batchJob.StartTime) > rm.batchTimeout {
-			log.Printf("REPLICATION: Batch job for %s timed out, cleaning up", serverAddr)
-			delete(rm.batchReplications, serverAddr)
-		}
-	}
-}
-
-func (rm *ReplicationManager) processQueueStatus() {
-	normalQueueLen := len(rm.replicationQueue)
-	priorityQueueLen := len(rm.priorityQueue)
-
-	if normalQueueLen > 800 {
-		log.Printf("REPLICATION: WARNING - Normal queue is %d%% full (%d/1000)",
-			(normalQueueLen*100)/1000, normalQueueLen)
-	}
-	if priorityQueueLen > 400 {
-		log.Printf("REPLICATION: WARNING - Priority queue is %d%% full (%d/500)",
-			(priorityQueueLen*100)/500, priorityQueueLen)
 	}
 }
 
