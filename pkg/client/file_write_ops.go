@@ -241,7 +241,6 @@ func (fs *Filesystem) ensureChunkExists(inode uint64, chunkIndex uint64) (string
 		chunkHandle = resp.Inode.ChunkHandles[chunkIndex]
 	}
 
-	// Get chunk locations and lease information
 	chunkResp, err := fs.masterClient.GetChunkLocations(ctx, &master.GetChunkLocationsRequest{
 		ChunkHandles: []string{chunkHandle},
 	})
@@ -258,16 +257,42 @@ func (fs *Filesystem) ensureChunkExists(inode uint64, chunkIndex uint64) (string
 	leaseResp, err := fs.masterClient.GetLeaseInfo(ctx, &master.GetLeaseInfoRequest{
 		ChunkHandle: chunkHandle,
 	})
+	
+	// If no lease exists or lease has expired, request a new one
 	if err != nil {
-		return "", "", nil, 0, fmt.Errorf("failed to get lease info: %w", err)
+		log.Printf("[INFO] No active lease for chunk %s, requesting new lease: %v", chunkHandle, err)
+		
+		grantResp, err := fs.masterClient.GrantLease(ctx, &master.GrantLeaseRequest{
+			ChunkHandle:      chunkHandle,
+			RequestingServer: "", // Let master choose primary
+			Replicas:         extractAddresses(chunkInfo.Locations),
+			Version:          uint64(chunkInfo.Version),
+		})
+		if err != nil {
+			return "", "", nil, 0, fmt.Errorf("failed to grant new lease for chunk %s: %w", chunkHandle, err)
+		}
+		
+		primaryAddr := grantResp.Primary
+		if primaryAddr == "" {
+			return "", "", nil, 0, fmt.Errorf("no primary assigned for chunk %s", chunkHandle)
+		}
+		
+		var replicaAddrs []string
+		for _, location := range chunkInfo.Locations {
+			if location.Address != primaryAddr {
+				replicaAddrs = append(replicaAddrs, location.Address)
+			}
+		}
+		
+		return chunkHandle, primaryAddr, replicaAddrs, chunkInfo.Version, nil
 	}
 
+	// Use existing lease
 	primaryAddr := leaseResp.Primary
 	if primaryAddr == "" {
 		return "", "", nil, 0, fmt.Errorf("no primary found for chunk %s", chunkHandle)
 	}
 
-	// Collect replica addresses (excluding primary)
 	var replicaAddrs []string
 	for _, location := range chunkInfo.Locations {
 		if location.Address != primaryAddr {
@@ -510,6 +535,15 @@ func (fs *Filesystem) updateFileSize(cancel <-chan struct{}, inode uint64, newSi
 	})
 
 	return err
+}
+
+// extractAddresses extracts addresses from chunk locations
+func extractAddresses(locations []*common.ChunkLocation) []string {
+	var addresses []string
+	for _, location := range locations {
+		addresses = append(addresses, location.Address)
+	}
+	return addresses
 }
 
 // Helper functions

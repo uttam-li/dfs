@@ -14,7 +14,7 @@ const (
 	DefaultMaxInodes                = 1000000          // 1 Million
 	DefaultHeartbeatInterval        = 30 * time.Second
 	DefaultHeartbeatTimeout         = 60 * time.Second
-	DefaultLeaseTimeout             = 30 * time.Second
+	DefaultLeaseTimeout             = 30 * time.Minute
 	DefaultCheckpointInterval       = 2 * time.Minute
 	DefaultGCInterval               = 5 * time.Minute
 	DefaultOrphanedChunkGracePeriod = 24 * time.Hour

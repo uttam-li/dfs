@@ -300,17 +300,28 @@ func (ms *MasterService) removeChunkMetadataAndScheduleDeletion(chunks map[uint6
 		return
 	}
 
-	log.Printf("Removing metadata and scheduling deletion for %d chunks", len(chunks))
+	log.Printf("Removing metadata and performing immediate deletion for %d chunks", len(chunks))
 
 	for chunkIndex, chunkHandle := range chunks {
 		// Get chunk metadata before removing it
 		if chunkMeta, exists := ms.master.ChunkMetadata[chunkHandle]; exists {
-			// Schedule deletion on all chunk servers that have this chunk
-			if ms.replicationManager != nil && ms.replicationManager.IsRunning() {
-				for _, serverAddr := range chunkMeta.Locations {
-					log.Printf("Scheduling deletion of chunk %v from server %s (inode deletion)",
-						chunkHandle, serverAddr)
-					ms.replicationManager.QueueChunkDeletion(chunkHandle, serverAddr, "inode deletion")
+			if ms.gcManager != nil {
+				log.Printf("Immediately deleting chunk %v from %d servers (atomic file operation)",
+					chunkHandle, len(chunkMeta.Locations))
+				
+				success := ms.gcManager.deleteChunkFromServers(chunkHandle, chunkMeta.Locations)
+				if success {
+					log.Printf("Successfully deleted chunk %v from servers", chunkHandle)
+				} else {
+					log.Printf("Warning: Failed to delete chunk %v from some servers", chunkHandle)
+				}
+			} else {
+				if ms.replicationManager != nil && ms.replicationManager.IsRunning() {
+					for _, serverAddr := range chunkMeta.Locations {
+						log.Printf("Scheduling deletion of chunk %v from server %s (fallback)",
+							chunkHandle, serverAddr)
+						ms.replicationManager.QueueChunkDeletion(chunkHandle, serverAddr, "inode deletion")
+					}
 				}
 			}
 

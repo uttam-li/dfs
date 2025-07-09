@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"log"
+	"syscall"
 	"time"
 
 	"github.com/google/btree"
@@ -360,14 +361,24 @@ func (ms *MasterService) validateNewParent(newParentIno uint64) error {
 
 // performAtomicMove executes the atomic move operation
 func (ms *MasterService) performAtomicMove(oldItem, newItem *types.BTreeItem, newParentIno uint64, newName string) error {
-	// Check if destination already exists
+	var deletedInode *types.Inode
+	
+	// Check if destination already exists and prepare for replacement
 	if existingItem := ms.master.Metadata.Get(newItem); existingItem != nil {
-		return fmt.Errorf("destination already exists: %s", newName)
+		existingBTreeItem := existingItem.(*types.BTreeItem)
+		deletedInode = existingBTreeItem.Inode
+		
+		ms.master.Metadata.Delete(existingBTreeItem)
+		log.Printf("[INFO] MoveEntry: replacing existing file %s (inode %d) with %s (inode %d)", 
+			newName, deletedInode.Ino, oldItem.Key.Name, newItem.Inode.Ino)
 	}
 
-	// Perform atomic move
 	ms.master.Metadata.Delete(oldItem)
 	ms.master.Metadata.ReplaceOrInsert(newItem)
+
+	if deletedInode != nil {
+		go ms.scheduleReplacedInodeCleanup(deletedInode)
+	}
 
 	return nil
 }
@@ -395,4 +406,22 @@ func (ms *MasterService) findChildren(parentIno uint64) []*types.BTreeItem {
 		return true
 	})
 	return children
+}
+
+// scheduleReplacedInodeCleanup handles cleanup of an inode that was replaced during rename
+func (ms *MasterService) scheduleReplacedInodeCleanup(deletedInode *types.Inode) {
+	if deletedInode == nil {
+		return
+	}
+	
+	log.Printf("[INFO] scheduleReplacedInodeCleanup: cleaning up replaced inode %d", deletedInode.Ino)
+	
+	mode := deletedInode.GetMode()
+	if (mode & syscall.S_IFREG) != 0 { // Regular file
+		ms.processChunkDeletions(deletedInode, deletedInode.Ino)
+	}
+
+	if deletedInode.IsDir() {
+		log.Printf("[WARNING] scheduleReplacedInodeCleanup: attempted to replace directory inode %d", deletedInode.Ino)
+	}
 }
